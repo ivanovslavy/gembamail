@@ -1,0 +1,30 @@
+# Secrets - NEVER commit
+*.conf
+!*.conf.example
+*.key
+*.pem
+*.private
+.env
+secrets/
+
+# Mailcow specific
+mailcow.conf
+data/conf/postfix/extra.cf
+data/conf/dovecot/extra.conf
+data/assets/ssl/
+data/assets/ssl-example/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Logs
+*.log
+logs/
+
+# Backups
+*.bak
+*.backup
