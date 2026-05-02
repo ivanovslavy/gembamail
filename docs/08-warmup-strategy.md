@@ -30,7 +30,9 @@ These are typical curves, not guarantees. Deployments that send too aggressively
 
 The timeline above assumes a typical deployment. In practice, with all the technical pieces in place from day one and natural engagement patterns, reputation can build noticeably faster than the conservative estimates suggest.
 
-A reference deployment showed the following progression for the **first domain** added (`gembamail.com`):
+A reference deployment showed the following progression. Three production domains were migrated to a single Mailcow instance over approximately 12 hours of work, with the following observed timing.
+
+### First domain (`gembamail.com`) — infrastructure
 
 **Hours 0–4:**
 - Mail-Tester: 10/10 on first attempt
@@ -47,23 +49,49 @@ A reference deployment showed the following progression for the **first domain**
 - ProtonMail began accepting messages from the same sender that had been rejected 12 hours earlier
 - Multiple ProtonMail addresses (different from the rejected ones) accepted on first attempt
 
-Then **a second domain** (`gembait.com`) was added to the same Mailcow instance — same server, same IP, fresh `From:` domain. Results from the first day of the new domain:
+### Second domain (`gembait.com`) — IT studio website
 
+Added to the same Mailcow instance the next day. Same server, same IP, fresh `From:` domain. Results from the first day of the new domain:
+
+- Mail-Tester: 10/10 on first attempt
 - Gmail (engaged recipient): Inbox direct on first attempt
-- Yahoo (cold contact): Inbox direct on first attempt
+- Yahoo (cold contact): Inbox direct on first attempt with reply chain
 - ProtonMail (separate addresses): Inbox direct on first attempt
 
-**The pattern that explains this:** receivers track reputation at multiple granularities — IP, IP subnet, sending domain, From domain. Once the IP has built positive reputation through one domain, additional From-domains added to the same IP inherit a portion of that trust. The new domain still has zero individual reputation, but the IP and subnet score remain favorable.
+A live contact form on the corresponding website was migrated to use the new mailbox via SMTP submission on the same day. No deliverability issues.
+
+### Third domain (`gembapay.com`) — payment platform
+
+Migrated later the same day, requiring more work because the existing system used a third-party transactional email provider (Brevo HTTP API) for verification codes, invoices, and contact form notifications. The migration involved:
+
+- DNS cleanup (removing the previous provider's MX, DKIM, SPF includes)
+- Mailcow domain provisioning (DKIM, mailboxes, MTA-STS, TLS-RPT)
+- Backend code refactor from raw HTTP API calls to nodemailer SMTP
+- Architecture decision: dual-mailbox routing — `noreply@` for transactional flows (verification codes, invoices), `contacts@` for human-handled flows (contact form)
+- Production verification: contact form submission, invoice ZIP delivery to accountant, merchant registration with verification code
+
+Results on first day:
+- Mail-Tester: 10/10 on first attempt
+- Gmail Inbox direct delivery for verification codes
+- ZIP attachment (24KB) delivered cleanly
+- All three test flows (contact form, accountant ZIP, verification code) verified working end-to-end with proper SMTP-level mailbox separation visible in Postfix logs (`sasl_username=` matching the From-domain mailbox in each case)
+
+### What this pattern shows
+
+Receivers track reputation at multiple granularities — IP, IP subnet, sending domain, From domain. Once the IP has built positive reputation through one domain, additional From-domains added to the same IP inherit a portion of that trust. The new domain still has zero individual reputation, but the IP and subnet score remain favorable.
 
 This means the second and third domains migrated to the same Mailcow instance benefit from work done warming up the first one. The conservative "two weeks per domain" timeline collapses substantially.
+
+The third domain is particularly notable: it carries production traffic (payment platform, real merchant registrations), uses dual-mailbox routing for proper transactional hygiene, and was migrated alongside a complete backend refactor — yet first-day delivery worked cleanly across all flows including binary ZIP attachments.
 
 **This does not mean technical configuration can be skipped.** The fast trajectory observed required:
 
 - All authentication records correct from the start (SPF, DKIM, DMARC, MTA-STS, TLS-RPT, DNSSEC, FCrDNS for both IPv4 and IPv6)
 - IP confirmed clean before deployment (Spamhaus, Talos, MXToolbox)
 - Real engagement signals — actual replies, not test broadcasts
-- Conservative volume — fewer than 50 outbound messages in the first 24 hours
+- Conservative volume — fewer than 50 outbound messages in the first 24 hours per domain
 - Conversational content, not formatted promotional templates
+- Per-flow From-address discipline (transactional from `noreply@`, human-handled from `contacts@`) for the third domain
 
 Without these, the curve looks like the conservative timeline above. With them, it can look like this faster trajectory. There is no shortcut for the technical preparation — only for what comes after it.
 
@@ -207,9 +235,42 @@ A safe migration sequence for multiple business domains:
 2. Use it for personal and infrastructure email for at least 24–72 hours, building genuine engagement
 3. Migrate the first business domain — one with relatively low traffic and known recipients
 4. Wait a day or two, monitor delivery patterns
-5. Migrate higher-traffic domains in sequence
+5. Migrate higher-traffic domains in sequence, including ones with production application traffic
 
 For most small businesses, all relevant domains can be on the new server within a week without delivery problems.
+
+## Migrating production application traffic
+
+When a domain is being migrated alongside a backend application that sends transactional email (payment confirmations, invoices, verification codes), the migration involves more than DNS and mailbox provisioning. The application code has to be refactored from whatever transactional provider it currently uses (Brevo, SendGrid, Mailgun, AWS SES, Postmark, Resend) to plain SMTP through Mailcow.
+
+A few considerations specific to this case:
+
+**Dual-mailbox routing.** For applications that send both automated messages (verification codes, invoices, payment receipts) and human-handled messages (contact form submissions, customer support replies), use two mailboxes on the same domain:
+
+- `noreply@yourdomain.com` for automated/transactional flows
+- `contacts@yourdomain.com` (or `support@`, depending on convention) for human-handled flows
+
+The application authenticates as `noreply@` for the automated path and as `contacts@` for the human path. From the receiver's perspective, the From-domain is the same, but the per-flow mailbox separation produces cleaner reputation tracking and clearer UX (recipients understand `noreply@` is automated and won't expect a human to read replies to it).
+
+This separation is visible at the SMTP layer: Postfix logs show `sasl_username=noreply@yourdomain.com` for one flow and `sasl_username=contacts@yourdomain.com` for the other. That log line is the authoritative confirmation that mailbox routing is actually working — header inspection in a mail client can be spoofed, but SMTP-level authentication cannot.
+
+**Same password vs separate passwords.** Both mailboxes can share the same password to simplify the application's `.env` configuration (one `SMTP_PASS` for both `SMTP_NOREPLY_USER` and `SMTP_CONTACTS_USER`). Separate passwords are more secure but add operational overhead. For most small deployments, a shared password is an acceptable trade-off; the credential is still file-permission-protected on the server and rotates atomically when needed.
+
+**Reply-To discipline.** Verification codes from `noreply@` should keep `Reply-To` set to `noreply@` — recipients shouldn't reply, and if they do, an auto-responder on `noreply@` redirects them to the real support address. Invoices from `noreply@` should set `Reply-To: contacts@` so that recipients who hit "Reply" land in the human-monitored mailbox. Contact-form admin notifications should preserve the visitor's email address as `Reply-To` so the recipient can respond directly to the visitor.
+
+**Auto-responder for noreply@.** Configure a vacation-style auto-responder on the `noreply@` mailbox in SOGo with a clear message redirecting humans to the real support address. Set the response interval to "once per 7 days per sender" to prevent loops with mailing lists. Do not enable "Discard incoming mails during vacation" — let messages arrive normally so they can be reviewed if needed; the auto-responder handles the user-facing flow.
+
+**Disable IMAP for noreply@.** Once the auto-responder is configured and tested, disable IMAP login for the `noreply@` mailbox in Mailcow Admin. The application uses SMTP submission only and never needs to read from `noreply@`. Disabling IMAP reduces attack surface. (Re-enable temporarily if administrative access to the mailbox is needed later.)
+
+**Migration order.** Test in increasing order of stakes:
+
+1. Contact form (lowest risk — visitors notice immediately if it breaks)
+2. Owner-triggered manual flows (e.g., "Send to accountant" buttons — recoverable, retry available)
+3. Highest-stakes automated flows (e.g., merchant registration verification codes — broken sends mean lost signups)
+
+Each test should be verified at three layers: (a) backend application logs show successful send, (b) Postfix logs show correct `sasl_username=` and `status=sent (250 OK)`, (c) recipient inbox shows the message with correct From, Reply-To, and any attachments intact. Don't move to the next test until all three layers confirm the previous one.
+
+**Decommissioning the previous provider.** Only after end-to-end verification works should the old provider's API key, DNS records, and code paths be removed. Keep them in place during the migration window so rollback is one DNS edit away if something unexpected breaks.
 
 ## Monitoring the warmup
 
@@ -264,7 +325,7 @@ If reputation has built cleanly, the domain is now a real production sender.
 
 Authentication is configured. Reputation is built.
 
-The technical setup of this server is at the level of professional email services. Reputation will eventually be at the same level — through consistent, measured, real usage over weeks. In favorable cases, the curve compresses dramatically: the real-world observation in this guide showed Inbox delivery at Gmail, Yahoo, and ProtonMail (after initial rejection) within the first 24 hours, and a second domain on the same IP achieving Inbox delivery on the very first attempt.
+The technical setup of this server is at the level of professional email services. Reputation will eventually be at the same level — through consistent, measured, real usage over weeks. In favorable cases, the curve compresses dramatically: the real-world observation in this guide showed Inbox delivery at Gmail, Yahoo, and ProtonMail (after initial rejection) within the first 24 hours for the first domain, and Inbox delivery on the very first attempt for a second and third domain on the same IP — including a third domain carrying production payment-platform traffic with dual-mailbox routing.
 
 These results required the technical groundwork to be solid. They are not magic. They are what happens when authentication is correct, the IP is clean, the volume is conservative, and the engagement is real.
 
