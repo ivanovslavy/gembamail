@@ -95,6 +95,83 @@ Ask the recipient to:
 
 After these actions, future messages from the same sender to the same recipient land in Inbox. Gmail tracks per-sender-per-recipient trust separately.
 
+## Hetzner IPv6 PTR — wrong default suffix
+
+**Symptom:** Outbound mail to Cloudflare-routed domains (or other strict receivers) fails with:
+
+```
+enforced-tls-smtp/smtp[]: host route2.mx.cloudflare.net refused to talk to me: 
+550 Sender IP reverse lookup rejected (2a01:4f8:c013:1ee0::1).
+```
+
+Postfix then falls back to IPv4 and delivery succeeds, but every send incurs the failed IPv6 attempt first. Mail to Gmail and Outlook works fine because they accept IPv4 fallback without complaint.
+
+**Cause:** Hetzner Cloud assigns each server a `/64` IPv6 block (e.g., `2a01:4f8:c013:1ee0::/64`), but the **Edit Reverse DNS** dialog in the Console defaults the host suffix to `::` — which is the network address of the entire block, not the specific host IP.
+
+The result: PTR is published for `2a01:4f8:c013:1ee0::` (the network address), but Postfix sends from `2a01:4f8:c013:1ee0::1` (the first host in the block, which Mailcow auto-configures).
+
+Strict receivers like Cloudflare Email Routing and ProtonMail perform reverse lookup on the actual sending IP, find no PTR, and reject the connection.
+
+**Diagnosis:**
+
+Local `dig -x` may return a correct-looking answer because `/etc/hosts` includes the mapping. Always verify with a public DNS resolver:
+
+```bash
+# This is what external receivers see
+dig @8.8.8.8 +short -x 2a01:4f8:c013:1ee0::1
+dig @1.1.1.1 +short -x 2a01:4f8:c013:1ee0::1
+```
+
+If both return empty, the public PTR is missing.
+
+For comparison, the local lookup that hits `/etc/hosts` may show:
+
+```bash
+dig +short -x 2a01:4f8:c013:1ee0::1
+mail.example.com.
+mail.                   # ← invalid second answer from /etc/hosts
+```
+
+The presence of two answers, or an answer with no TLD, is also a sign the public PTR is wrong.
+
+**Fix:**
+
+1. Hetzner Cloud Console → Server → **Networking** tab
+2. Find the IPv6 row (`2a01:4f8:c013:1ee0::/64`)
+3. Click ⋯ → **Edit Reverse DNS**
+4. The dialog shows two fields: prefix (e.g., `2a01:4f8:c013:1ee0`) and suffix (default: `::`)
+5. **Change suffix from `::` to `::1`** (or to whatever specific IP the server actually uses)
+6. Confirm the Reverse DNS field shows the mail hostname (`mail.example.com`)
+7. Click **Edit Reverse DNS** to save
+
+**Verify within 30–60 seconds:**
+
+```bash
+dig @8.8.8.8 +short -x 2a01:4f8:c013:1ee0::1
+# Must return: mail.example.com.
+```
+
+Then retry sending mail to the previously failing recipient. The first connection attempt should now succeed over IPv6:
+
+```bash
+docker compose logs postfix-mailcow --since 1m | grep -E "Verified TLS|status=sent|reverse lookup"
+```
+
+Expected output:
+
+```
+enforced-tls-smtp/smtp[]: Verified TLS connection established to 
+    route2.mx.cloudflare.net[2606:4700:f5::f]:25: TLSv1.2 ...
+enforced-tls-smtp/smtp[]: ...: to=<recipient@example.com>, 
+    relay=route2.mx.cloudflare.net[2606:4700:f5::f]:25, status=sent
+```
+
+The relay IP being IPv6 (rather than IPv4) confirms the fix is working.
+
+**Why this matters beyond Cloudflare:**
+
+A correct IPv6 PTR is part of FCrDNS (Forward-Confirmed reverse DNS), which is a baseline trust signal at every major receiver. Even if Gmail and Outlook tolerate the missing PTR by falling back to IPv4, deliverability scoring treats IPv6 sending with valid FCrDNS as a positive signal. Fixing this also unlocks faster delivery (no failed IPv6 attempt before IPv4 retry) and removes the "refused to talk to me" entries that clutter logs and may eventually trigger reputation alerts.
+
 ## Mail-Tester score below 10
 
 **Symptom:** Mail-Tester reports a score under 10 with specific issues identified.
@@ -121,6 +198,7 @@ The detail page shows what failed. Common causes:
 **Reverse DNS issue:**
 - PTR record not set, or set to wrong hostname
 - Hostname does not resolve to the IP
+- IPv6 PTR set on network address instead of host IP (see "Hetzner IPv6 PTR" above)
 
 Each issue has its own fix; the Mail-Tester report identifies which.
 
@@ -234,7 +312,7 @@ Common causes from log patterns:
 The receiver rejected. The 5xx code and message identify why. Most common:
 - 550 — recipient address does not exist
 - 554 — content-based rejection (often "rejected by rspamd filter" from ProtonMail, see above)
-- 5.7.1 — policy rejection, often spam-related
+- 5.7.1 — policy rejection, often spam-related, sometimes reverse DNS related (see "Hetzner IPv6 PTR" above)
 
 **`status=deferred (...)`**
 Temporary failure. Postfix retries automatically. Common reasons:
@@ -308,7 +386,7 @@ The deployment described in this guide enables Hetzner's daily backups precisely
 Most issues fall into a few categories:
 
 - **Reputation problems** — solved by time and engagement, not configuration changes
-- **DNS issues** — solved by careful verification of every record
+- **DNS issues** — solved by careful verification of every record (including IPv6 PTR specifics)
 - **Configuration drift** — solved by following Mailcow's documented patterns and not editing internal containers
 - **Resource exhaustion** — solved by appropriate sizing and swap
 
