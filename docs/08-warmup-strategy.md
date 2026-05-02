@@ -30,7 +30,7 @@ These are typical curves, not guarantees. Deployments that send too aggressively
 
 The timeline above assumes a typical deployment. In practice, with all the technical pieces in place from day one and natural engagement patterns, reputation can build noticeably faster than the conservative estimates suggest.
 
-A reference deployment showed the following progression. Three production domains were migrated to a single Mailcow instance over approximately 12 hours of work, with the following observed timing.
+A reference deployment migrated **four production domains** to a single Mailcow instance over approximately 14 hours of work, with the following observed timing.
 
 ### First domain (`gembamail.com`) — infrastructure
 
@@ -51,7 +51,7 @@ A reference deployment showed the following progression. Three production domain
 
 ### Second domain (`gembait.com`) — IT studio website
 
-Added to the same Mailcow instance the next day. Same server, same IP, fresh `From:` domain. Results from the first day of the new domain:
+Added to the same Mailcow instance the next day. Same server, same IP, fresh `From:` domain. Results from the first day:
 
 - Mail-Tester: 10/10 on first attempt
 - Gmail (engaged recipient): Inbox direct on first attempt
@@ -60,9 +60,9 @@ Added to the same Mailcow instance the next day. Same server, same IP, fresh `Fr
 
 A live contact form on the corresponding website was migrated to use the new mailbox via SMTP submission on the same day. No deliverability issues.
 
-### Third domain (`gembapay.com`) — payment platform
+### Third domain (`gembapay.com`) — payment platform with backend refactor
 
-Migrated later the same day, requiring more work because the existing system used a third-party transactional email provider (Brevo HTTP API) for verification codes, invoices, and contact form notifications. The migration involved:
+Migrated several hours later, requiring more work because the existing system used a third-party transactional email provider (Brevo HTTP API) for verification codes, invoices, and contact form notifications. The migration involved:
 
 - DNS cleanup (removing the previous provider's MX, DKIM, SPF includes)
 - Mailcow domain provisioning (DKIM, mailboxes, MTA-STS, TLS-RPT)
@@ -74,15 +74,29 @@ Results on first day:
 - Mail-Tester: 10/10 on first attempt
 - Gmail Inbox direct delivery for verification codes
 - ZIP attachment (24KB) delivered cleanly
-- All three test flows (contact form, accountant ZIP, verification code) verified working end-to-end with proper SMTP-level mailbox separation visible in Postfix logs (`sasl_username=` matching the From-domain mailbox in each case)
+- All three test flows verified working end-to-end with proper SMTP-level mailbox separation visible in Postfix logs (`sasl_username=` matching the From-domain mailbox in each case)
+
+### Fourth domain (`gembaindustrial.com`) — refinery services
+
+Migrated on the same day as the previous three. Same setup pattern as gembait.com (Express + nodemailer with credentials in systemd `Environment=` lines, not `.env` file). Two endpoints: `/api/contact` and `/api/career` (with multer CV uploads).
+
+The migration revealed a **systemd-specific gotcha** worth documenting: multi-word `Environment=` values must be quoted, otherwise systemd silently splits the value at whitespace and ignores everything after the first word. See "Systemd Environment= quoting" below.
+
+After fixing the quoting issue:
+- Mail-Tester: 10/10 on first attempt
+- Gmail Inbox direct delivery for contact form admin notifications
+- Auto-reply path added (it didn't exist in the original code) for parity with the IT studio site
+- Both contact form and career application form (with CV attachment) verified end-to-end
 
 ### What this pattern shows
 
 Receivers track reputation at multiple granularities — IP, IP subnet, sending domain, From domain. Once the IP has built positive reputation through one domain, additional From-domains added to the same IP inherit a portion of that trust. The new domain still has zero individual reputation, but the IP and subnet score remain favorable.
 
-This means the second and third domains migrated to the same Mailcow instance benefit from work done warming up the first one. The conservative "two weeks per domain" timeline collapses substantially.
+This means the second, third, and fourth domains migrated to the same Mailcow instance benefit from work done warming up the first one. The conservative "two weeks per domain" timeline collapses substantially.
 
 The third domain is particularly notable: it carries production traffic (payment platform, real merchant registrations), uses dual-mailbox routing for proper transactional hygiene, and was migrated alongside a complete backend refactor — yet first-day delivery worked cleanly across all flows including binary ZIP attachments.
+
+The fourth domain demonstrated that the IP's accumulated reputation continued to compound: by the time it was added (the same day as the first three), Gmail's filter showed no spam folder placement at all for the first messages, and the sole issue encountered was a systemd configuration bug unrelated to email reputation.
 
 **This does not mean technical configuration can be skipped.** The fast trajectory observed required:
 
@@ -272,6 +286,64 @@ Each test should be verified at three layers: (a) backend application logs show 
 
 **Decommissioning the previous provider.** Only after end-to-end verification works should the old provider's API key, DNS records, and code paths be removed. Keep them in place during the migration window so rollback is one DNS edit away if something unexpected breaks.
 
+## Systemd `Environment=` quoting
+
+A subtle but production-impacting issue when using systemd unit files to inject SMTP credentials into a Node.js (or any other) backend.
+
+If a systemd unit looks like this:
+
+```ini
+Environment=SMTP_FROM_NAME=GEMBA IT Studio
+```
+
+systemd will silently split the value at whitespace and **ignore the rest**:
+
+```
+systemd[1]: /etc/systemd/system/gembait.service:21: Invalid environment assignment, ignoring: IT
+systemd[1]: /etc/systemd/system/gembait.service:21: Invalid environment assignment, ignoring: Studio
+```
+
+The backend process sees `SMTP_FROM_NAME=GEMBA` (just the first word). The service starts cleanly, the SMTP connection verifies fine, contact-form submissions arrive — but every outbound email shows a truncated From display name. Recipients see `GEMBA <contacts@example.com>` instead of `GEMBA IT Studio <contacts@example.com>`.
+
+The fix is to quote the entire `KEY=VALUE` expression:
+
+```ini
+Environment="SMTP_FROM_NAME=GEMBA IT Studio"
+```
+
+Note the quote position: it wraps the **entire assignment** including the variable name, not just the value. This is a systemd-specific syntax detail and is easy to miss because the unit file appears valid and the service starts without error.
+
+To detect this issue on an existing deployment:
+
+```bash
+sudo journalctl -u <your-service> --since "1 hour ago" | grep -i "invalid environment"
+```
+
+If you see "Invalid environment assignment, ignoring: …" lines, you have multi-word values that aren't quoted. After fixing the unit file:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart <your-service>
+sudo journalctl -u <your-service> --since "1 minute ago" | grep -i invalid
+```
+
+The output should be empty.
+
+A safer alternative is to move secrets and multi-word values into an `EnvironmentFile=` rather than inline `Environment=` lines. The dotenv-style file format doesn't have the same whitespace splitting behavior:
+
+```ini
+[Service]
+EnvironmentFile=/path/to/your/app/.env
+```
+
+With the `.env` file containing:
+
+```
+SMTP_FROM_NAME=GEMBA IT Studio
+```
+
+This works correctly without quoting and has the additional benefit of separating secrets from the unit file (which is often more permissively readable than `.env`).
+
 ## Monitoring the warmup
 
 In the first weeks:
@@ -325,7 +397,7 @@ If reputation has built cleanly, the domain is now a real production sender.
 
 Authentication is configured. Reputation is built.
 
-The technical setup of this server is at the level of professional email services. Reputation will eventually be at the same level — through consistent, measured, real usage over weeks. In favorable cases, the curve compresses dramatically: the real-world observation in this guide showed Inbox delivery at Gmail, Yahoo, and ProtonMail (after initial rejection) within the first 24 hours for the first domain, and Inbox delivery on the very first attempt for a second and third domain on the same IP — including a third domain carrying production payment-platform traffic with dual-mailbox routing.
+The technical setup of this server is at the level of professional email services. Reputation will eventually be at the same level — through consistent, measured, real usage over weeks. In favorable cases, the curve compresses dramatically: the real-world observation in this guide showed Inbox delivery at Gmail, Yahoo, and ProtonMail (after initial rejection) within the first 24 hours for the first domain, and Inbox delivery on the very first attempt for second, third, and fourth domains on the same IP — including a third domain carrying production payment-platform traffic with dual-mailbox routing, and a fourth domain with file-attachment career-application forms.
 
 These results required the technical groundwork to be solid. They are not magic. They are what happens when authentication is correct, the IP is clean, the volume is conservative, and the engagement is real.
 
