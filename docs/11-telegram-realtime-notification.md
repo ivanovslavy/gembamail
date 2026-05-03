@@ -63,14 +63,25 @@ End-to-end latency: typically 1–2 seconds from `Postfix received` to the notif
 - A Telegram account
 - Outbound HTTPS to `api.telegram.org` (no inbound exposure required)
 
+## A note on credentials
+
+The bot token and chat ID below are referred to as `<BOT_TOKEN>` and `<CHAT_ID>` throughout. Treat these like passwords:
+
+- **Never commit them to git** — anyone with the bot token can post as the bot
+- **Never paste them into screenshots** that go on Discord, Reddit, support forums, or social media
+- **Store them in your password manager** alongside the IMAP passwords
+- **If ever exposed** (accidentally committed, screenshot, leaked log), revoke immediately via BotFather `/revoke`
+
+Token revocation is instant and free — there is no penalty for rotating, and "I think I might have leaked it" is sufficient cause to rotate.
+
 ## Step 1 — Create the Telegram bot
 
 1. Open Telegram, find `@BotFather`, send `/start`.
 2. Send `/newbot`. BotFather asks for:
-   - **Display name** — anything human-readable (e.g. `GembaMail Notifier`)
-   - **Username** — must end in `bot` and be globally unique (e.g. `gembamail_notifier_bot`)
-3. BotFather replies with a token of the form `8605890011:AAE5mIPCB3xOhQuUYCThP4Q-...`
-4. Save the token in your password manager. It is the entire authentication for the bot — anyone with the token can post as the bot.
+   - **Display name** — anything human-readable (e.g. `Mail Notifier`)
+   - **Username** — must end in `bot` and be globally unique (e.g. `mail_notifier_<unique>_bot`)
+3. BotFather replies with a token. Tokens follow the format `<numeric-bot-id>:<long-secret-string>`.
+4. Save the token in your password manager. It is the entire authentication for the bot.
 
 ## Step 2 — Discover your chat ID
 
@@ -78,10 +89,10 @@ The bot needs to know who to message. Telegram chats have integer IDs distinct f
 
 1. Search your bot by username in Telegram, click `Start`.
 2. Send any message (`hello` works).
-3. Open this URL in a browser, replacing `<TOKEN>`:
+3. Open this URL in a browser, replacing `<BOT_TOKEN>`:
 
    ```
-   https://api.telegram.org/bot<TOKEN>/getUpdates
+   https://api.telegram.org/bot<BOT_TOKEN>/getUpdates
    ```
 4. Find the `chat` object in the response:
 
@@ -90,7 +101,7 @@ The bot needs to know who to message. Telegram chats have integer IDs distinct f
      "ok": true,
      "result": [{
        "message": {
-         "chat": { "id": 7427418521, "first_name": "...", "type": "private" },
+         "chat": { "id": <CHAT_ID>, "first_name": "...", "type": "private" },
          "text": "hello"
        }
      }]
@@ -108,8 +119,8 @@ If `result` is `[]`, you haven't sent the bot a message yet — Telegram only qu
 From the server that will run the notifier:
 
 ```bash
-TOKEN="..."     # from step 1
-CHAT_ID="..."   # from step 2
+TOKEN="<BOT_TOKEN>"     # from step 1
+CHAT_ID="<CHAT_ID>"     # from step 2
 
 curl -s -X POST "https://api.telegram.org/bot$TOKEN/sendMessage" \
   -d "chat_id=$CHAT_ID" \
@@ -312,13 +323,23 @@ A few notes on the implementation:
 `.env`:
 
 ```ini
-TELEGRAM_TOKEN=8605890011:AAE5mIPCB3xOhQuUYCThP4Q-ua4-YU42BD8
-TELEGRAM_CHAT_ID=7427418521
-IMAP_HOST=mail.gembamail.com
+# All values below are placeholders — replace with real credentials.
+# This file MUST be chmod 600 and MUST NOT be committed to git.
+
+TELEGRAM_TOKEN=<BOT_TOKEN_FROM_BOTFATHER>
+TELEGRAM_CHAT_ID=<CHAT_ID_FROM_GETUPDATES>
+IMAP_HOST=mail.example.com
 IMAP_PORT=993
 
 # Comma-separated user:password pairs, one mailbox per pair
-MAILBOXES=contacts@example.com:PASS1,support@example.com:PASS2,info@other.com:PASS3
+MAILBOXES=contacts@example.com:<PASSWORD_1>,support@example.com:<PASSWORD_2>,info@other.com:<PASSWORD_3>
+```
+
+Add an `.env.example` to the repo with the same shape but no real values, and add `.env` to `.gitignore` immediately:
+
+```bash
+echo ".env" >> .gitignore
+echo "node_modules/" >> .gitignore
 ```
 
 The `MAILBOXES` format is intentionally a flat string. Originally the parsing supported a JSON list, but that made systemd `Environment=` quoting awkward. The simple comma-and-colon string format works whether the value comes from `.env` (where neither character has special meaning) or from a future systemd `EnvironmentFile=`.
@@ -335,16 +356,16 @@ For the deployment documented elsewhere in this guide, ten of nineteen active ma
 
 ```
 Monitored (10):
-  contacts@gembait.com           ← website inquiries
-  contacts@gembapay.com          ← payment platform support
-  contacts@gembaindustrial.com   ← refinery services inquiries
-  contacts@gembateam.com         ← team site contact form
-  contacts@gembatools.io         ← DEX support
-  contacts@gembaticket.com       ← ticketing platform support
-  office@gembapay.com            ← financial / accounting
-  security@gembapay.com          ← vulnerability disclosures (high priority)
-  support@gembapay.com           ← customer support
-  slavy@gembamail.com            ← personal master inbox
+  contacts@<domain1>             ← website inquiries
+  contacts@<domain2>             ← payment platform support
+  contacts@<domain3>             ← refinery services inquiries
+  contacts@<domain4>             ← team site contact form
+  contacts@<domain5>             ← DEX support
+  contacts@<domain6>             ← ticketing platform support
+  office@<domain2>               ← financial / accounting
+  security@<domain2>             ← vulnerability disclosures (high priority)
+  support@<domain2>              ← customer support
+  master@<personal-domain>       ← personal master inbox
 
 Not monitored (9):
   noreply@*  (×2)  — automated outbound; replies are spam, redirected by auto-responder
@@ -360,16 +381,15 @@ The pattern is: **monitor mailboxes where a missed message has a cost; skip mail
 ```ini
 [Unit]
 Description=GembaMail Telegram Notifier
-Documentation=https://github.com/ivanovslavy/gembamail
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=slavy
-Group=slavy
-WorkingDirectory=/home/slavy/gembamail-telegram
-ExecStart=/usr/bin/node /home/slavy/gembamail-telegram/notifier.js
+User=<your-user>
+Group=<your-user>
+WorkingDirectory=/home/<your-user>/gembamail-telegram
+ExecStart=/usr/bin/node /home/<your-user>/gembamail-telegram/notifier.js
 
 # Restart on failure (with backoff)
 Restart=always
@@ -390,7 +410,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/slavy/gembamail-telegram
+ReadWritePaths=/home/<your-user>/gembamail-telegram
 
 [Install]
 WantedBy=multi-user.target
@@ -421,11 +441,11 @@ A healthy startup looks like this in `journalctl -u gembamail-telegram`:
 Started gembamail-telegram.service
 Starting GembaMail Telegram Notifier
 Monitoring 10 mailbox(es):
-  - contacts@gembait.com
+  - contacts@<domain1>
   - ...
-[contacts@gembait.com] connecting...
-[contacts@gembait.com] connected, opening INBOX
-[contacts@gembait.com] watching for new messages (IMAP IDLE)
+[contacts@<domain1>] connecting...
+[contacts@<domain1>] connected, opening INBOX
+[contacts@<domain1>] watching for new messages (IMAP IDLE)
 ... (one block per mailbox)
 ```
 
@@ -441,18 +461,18 @@ Monitoring 10 mailbox(es).
 Send mail from any external address to one of the monitored mailboxes:
 
 ```
-To: contacts@gembait.com
+To: contacts@<domain1>
 Subject: Notifier verification
 ```
 
 Within one to two seconds, two things should happen:
 
-1. The journal logs `[contacts@gembait.com] notified: Notifier verification`.
+1. The journal logs `[contacts@<domain1>] notified: Notifier verification`.
 2. The phone (and desktop, if Telegram Desktop is running) shows a notification:
 
 ```
-🔔 [GEMBAIT]
-To: contacts@gembait.com
+🔔 [TAG]
+To: contacts@<domain1>
 From: Sender Name <sender@example.com>
 Subject: Notifier verification
 ```
@@ -480,6 +500,8 @@ iOS, Android, and macOS clients all behave the same way. Once the bot is paired 
 **Removing a mailbox.** Edit `.env`, remove the entry, restart. No state to clean up — the script holds nothing persistent.
 
 **Rotating a password.** Update Mailcow first (the mailbox owner), then update `.env`, then restart. The IMAP IDLE connection for that mailbox will fail on the next connection attempt and reconnect with the new credential.
+
+**Rotating the bot token.** If the token is ever exposed (committed to git, screenshot, leaked log), revoke it via BotFather `/revoke` immediately. BotFather issues a replacement instantly. Update `.env` with the new token and restart the service. The old token is dead the moment `/revoke` completes — no penalty for paranoid rotation.
 
 **Pausing notifications.** `sudo systemctl stop gembamail-telegram`. Mail still arrives normally; the notifier just isn't watching. Restart when ready.
 
@@ -510,7 +532,7 @@ On a 2 vCPU / 4 GB Hetzner CAX11 already running Mailcow (which takes ~2 GB), th
 
 **`Authentication failed`.** Wrong password in `.env`. Check the corresponding mailbox in Mailcow Admin. If the password contains `:` or `,`, it conflicts with the parsing format — generate a new one without those characters.
 
-**`Connection refused` or `ENOTFOUND`.** IMAP_HOST or IMAP_PORT is wrong, or DNS isn't resolving. Test with `openssl s_client -connect mail.gembamail.com:993` from the same host.
+**`Connection refused` or `ENOTFOUND`.** IMAP_HOST or IMAP_PORT is wrong, or DNS isn't resolving. Test with `openssl s_client -connect mail.example.com:993` from the same host.
 
 **Service starts but no Telegram messages.** Check the journal for `[telegram] ...` errors. Most commonly this is a wrong `TELEGRAM_TOKEN` or `TELEGRAM_CHAT_ID`. Verify with the curl test from Step 3.
 
@@ -520,10 +542,10 @@ On a 2 vCPU / 4 GB Hetzner CAX11 already running Mailcow (which takes ~2 GB), th
 
 **The journal fills with reconnect messages.** Something is repeatedly knocking the IMAP connection out — usually a misbehaving stateful firewall between the notifier host and the mail host. If they're the same host, this shouldn't happen; otherwise consider running the notifier on the mail host.
 
+**GitGuardian (or similar) flags a leaked token.** Revoke immediately via `@BotFather` → `/revoke`, regenerate, update `.env`, and restart the service. If the leak was via git, the token also lives in git history and should be removed with `git filter-repo` and a force push, even though revocation already neutralised the risk.
+
 ## Summary
 
 Ten mailboxes, one Node.js process, ~140 lines of code, ~40 MB of memory, sub-2-second notification latency. Setup time once the bot is created: about 30 minutes. The infrastructure to run it reliably (IMAP, TLS, the mail server itself) was already there.
 
 The result is a working passive monitoring system that covers a multi-domain self-hosted email setup without custom apps, browser tabs, or polling loops. It complements the Mailcow installation rather than competing with it — SOGo and Thunderbird remain the right places to read and reply, and the bot just makes sure nothing arrives unnoticed.
-
-Proceed to [12 — Maintenance](12-maintenance.md) for ongoing operational concerns.
