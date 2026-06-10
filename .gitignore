@@ -28,3 +28,13 @@ logs/
 # Backups
 *.bak
 *.backup
+node_modules/
+.env.*
+!.env.example
+*mnemonic*
+keyring*
+.claude/
+CLAUDE.md
+claude.md
+progress.md
+PROGRESS.md
